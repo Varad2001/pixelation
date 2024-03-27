@@ -1,0 +1,144 @@
+import cv2
+import cairocffi as cairo
+import numpy as np
+
+import taichi as ti
+ti.init(arch=ti.cpu)
+
+
+scale = 5
+
+@ti.dataclass
+class Circle:
+    x : int
+    y : int
+    r : int
+
+circles = Circle.field()
+ti.root.dynamic(ti.i, 100000, chunk_size=64).place(circles)
+
+
+def load_image(imgfile):
+    image = cv2.imread(imgfile)
+    h, w = image.shape[:2]
+    image = cv2.resize(
+        image, (int(scale * w), int(scale * h)),
+        interpolation=cv2.INTER_AREA
+    )
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def get_dist_transform_image(image):
+    canny = cv2.Canny(image, 100, 200)
+    edges_inv = 255 - canny
+    dist_image = cv2.distanceTransform(edges_inv, cv2.DIST_L2, 0)
+    return dist_image
+
+
+@ti.kernel
+def add_new_circles(filled: ti.types.ndarray(),
+                    dist_image: ti.types.ndarray(),
+                    min_radius: int, max_radius: int) -> int:
+    H, W = dist_image.shape[0], dist_image.shape[1]
+    ti.loop_config(serialize=True)
+    for x in range(min_radius, W - min_radius):
+        for y in range(min_radius, H - min_radius):
+            valid = True
+            if dist_image[y, x] > min_radius:
+                r = int((dist_image[y, x] + 1) / 2)
+                r = ti.min(r, max_radius)
+                if not filled[y, x] and r <= x < W - r and r <= y < H - r:
+                    for ii in range(x - r, x + r + 1):
+                        for jj in range(y - r, y + r + 1):
+                            if (ii - x) ** 2 + (jj - y)**2 < (r + 1) ** 2:
+                                if filled[jj, ii]:
+                                    valid = False
+                                    break
+                        if not valid:
+                            break
+
+                    if valid:
+                        circles.append(Circle(x+1, y, r))
+                        for ii in range(x - r, x + r + 1):
+                            for jj in range(y - r, y + r + 1):
+                                if (ii - x)**2 + (jj - y)**2 < (r + 1)**2:
+                                    filled[jj, ii] = 1
+
+    return circles.length()
+
+import random
+def plot_circles(image, ctx, n):
+    for i in range(n):
+        c = circles[i]
+        fc = image[c.y, c.x] / 255
+        if all(fc < 0.1):
+            ec = (0.5, 0.5, 0.5)
+        else:
+            ec = (0, 0, 0)
+        
+        # Draw filled inner circle with shading
+        for y in range(c.y - c.r, c.y + c.r + 1):
+            for x in range(c.x - c.r, c.x + c.r + 1):
+                if (x - c.x) ** 2 + (y - c.y) ** 2 <= c.r ** 2:
+                    # Calculate shading based on vertical position within the circle
+                    t = (y - c.y + c.r) / (2 * c.r)
+                    # Lighter shade for upper side, darker shade for lower side
+                    shade = 1 - t * 0.5  # Adjust shading factor as needed
+                    color = (shade, shade, shade)
+                    ctx.set_source_rgb(*color)
+                    ctx.rectangle(x, y, 1, 1)
+                    ctx.fill()
+
+        # Draw hollow outer circle
+        ctx.arc(c.x, c.y, c.r, 0, 2*np.pi)
+        ctx.set_source_rgba(*ec)
+        ctx.set_line_width(1)
+        ctx.stroke()
+
+        # Fill the region between the two circles with a random light shade color
+        ctx.arc(c.x, c.y, c.r , 0, 2*np.pi)  # Outer circle
+        ctx.arc(c.x, c.y, c.r/2, 0, 2*np.pi)      # Inner circle
+        ctx.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)  # Set fill rule to fill the area between the circles
+        
+        # Generate random light shade color for the region between circles
+        r = random.uniform(0.6, 1.0)  # Red component
+        g = random.uniform(0.6, 1.0)  # Green component
+        b = random.uniform(0.6, 1.0)  # Blue component
+        
+        ctx.set_source_rgb(*fc)  # Random light shade color
+        ctx.fill()
+
+        
+
+
+
+def add_layered_circles(filled, x, y, r):
+    circles.append(Circle(x, y, r))
+    inner_radius = r // 2
+    if inner_radius > 1:
+        add_layered_circles(filled, x, y, inner_radius)
+
+
+def main(imgfile, circle_sizes):
+    image = load_image(imgfile)
+    dist_image = get_dist_transform_image(image)
+    image = cv2.GaussianBlur(image, (5, 5), 0)
+    H, W = image.shape[:2]
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+    ctx = cairo.Context(surface)
+    ctx.set_source_rgb(0, 0, 0)
+    ctx.paint()
+
+    filled = np.zeros([H, W], dtype=np.int32)
+    R = circle_sizes
+    for i in range(1, len(R)):
+        n = add_new_circles(filled, dist_image, R[i], R[i - 1])
+
+    ctx.set_line_width(1)
+    plot_circles(image, ctx, n)
+    surface.write_to_png("circle_packing_result.png")
+
+
+if __name__ == '__main__':
+    circle_sizes = [25, 17,10]
+    main("image.png", circle_sizes)

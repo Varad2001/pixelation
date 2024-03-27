@@ -1,0 +1,4 @@
+opencv-python
+taichi
+cairocffi
+numpy
